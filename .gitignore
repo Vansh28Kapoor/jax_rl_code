@@ -162,6 +162,9 @@ cython_debug/
 *.ipynb
 wandb
 checkpoints
+lcbc_trained_checkpoints/
+new_lcbc_trained_checkpoints/
+susie_lcbc_trained_checkpoints/
 log
 render
 *.png

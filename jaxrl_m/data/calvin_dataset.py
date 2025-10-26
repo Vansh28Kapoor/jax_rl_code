@@ -94,6 +94,7 @@ class CalvinDataset:
         act_pred_horizon: Optional[int] = None,
         obs_horizon: Optional[int] = None,
         load_language: bool = False,
+        load_susie_goal_images: bool = False,
         skip_unlabeled: bool = False,
         **kwargs,
     ):
@@ -117,10 +118,13 @@ class CalvinDataset:
         self.act_pred_horizon = act_pred_horizon
         self.obs_horizon = obs_horizon
         self.is_train = train
+        self.load_susie_goal_images = load_susie_goal_images
         self.load_language = load_language
 
         if self.load_language:
             self.PROTO_TYPE_SPEC["language_annotation"] = tf.string
+        if self.load_susie_goal_images:
+            self.PROTO_TYPE_SPEC["susie_goal_images"] = tf.uint8
 
         # construct a dataset for each sub-list of paths
         datasets = []
@@ -155,6 +159,9 @@ class CalvinDataset:
             # this was the only way I found to avoid a memory leak in tf.random.Generator
             dataset = dataset.enumerate(start=seed)
             dataset = dataset.map(self._augment, num_parallel_calls=tf.data.AUTOTUNE)
+        else:
+            # even if not augmenting, we may need to concat susie goal images
+            dataset = dataset.map(self.susie_concat, num_parallel_calls=tf.data.AUTOTUNE)
 
         dataset = dataset.batch(
             batch_size,
@@ -231,7 +238,8 @@ class CalvinDataset:
             },
             **({"language": parsed_tensors["language_annotation"]} if self.load_language else {}),
             "actions": parsed_tensors["actions"][:-1],
-            "terminals": tf.zeros_like(parsed_tensors["actions"][:-1][:, 0:1], dtype=tf.bool)
+            "terminals": tf.zeros_like(parsed_tensors["actions"][:-1][:, 0:1], dtype=tf.bool),
+            **({"susie_goal_images": parsed_tensors["susie_goal_images"][:-1]} if self.load_susie_goal_images else {}),
         }
 
     def _process_actions(self, traj):
@@ -296,6 +304,19 @@ class CalvinDataset:
             traj["next_obs_chunks"] = tf.nest.map_structure(
                 lambda x: tf.gather(x, chunk_indices), traj["next_observations"]
             )
+            if self.load_susie_goal_images:
+                # Fix: Use tf.shape() instead of .shape for dynamic shapes
+                goal_shape = tf.shape(traj["susie_goal_images"])
+                # Create the broadcast shape dynamically
+                broadcast_shape = tf.concat([
+                    [traj_len, self.obs_horizon],
+                    goal_shape[1:]  # This works with tf.shape()
+                ], axis=0)
+                
+                traj["susie_goal_images"] = tf.broadcast_to(
+                    traj["susie_goal_images"][:, tf.newaxis, ...],
+                    broadcast_shape
+                )
         return traj
 
     def _add_goals(self, traj):
@@ -386,6 +407,32 @@ class CalvinDataset:
             image[key]["image"] = augment(
                 image[key]["image"], sub_seed, **self.augment_kwargs
             )
+        
+        # AFTER augmentation, concatenate susie goal images
+        if self.load_susie_goal_images and "susie_goal_images" in image:
+            # Apply same augmentation to susie goal images
+            image["susie_goal_images"] = augment(
+                image["susie_goal_images"], sub_seeds[0], **self.augment_kwargs
+            )
+            
+            # Now concatenate the augmented images
+            image["observations"]["image"] = tf.concat([
+                image["observations"]["image"], 
+                image["susie_goal_images"]
+            ], axis=-1)
+            
+            # Remove the separate susie_goal_images tensor
+            image.pop("susie_goal_images")
+        return image
+
+    def susie_concat(self, image):
+        if self.load_susie_goal_images and "susie_goal_images" in image:
+            image["observations"]["image"] = tf.concat([
+                    image["observations"]["image"], 
+                    image["susie_goal_images"]
+                ], axis=-1)
+                
+            image.pop("susie_goal_images")
         return image
 
     def iterator(self):

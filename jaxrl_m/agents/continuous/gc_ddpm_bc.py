@@ -13,7 +13,7 @@ from flax.core import FrozenDict
 from jaxrl_m.common.typing import Batch
 from jaxrl_m.common.typing import PRNGKey
 from jaxrl_m.common.common import JaxRLTrainState, ModuleDict, nonpytree_field
-from jaxrl_m.common.encoding import GCEncodingWrapper
+from jaxrl_m.common.encoding import GCEncodingWrapper, LCEncodingWrapper
 
 from jaxrl_m.networks.diffusion_nets import (
     FourierFeatures,
@@ -180,6 +180,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         actions: jnp.ndarray,
         # Model architecture
         encoder_def: nn.Module,
+        language_conditioned: bool = False,
         shared_goal_encoder: bool = True,
         early_goal_concat: bool = False,
         use_proprio: bool = False,
@@ -204,21 +205,30 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         assert len(actions.shape) > 1, "Must use action chunking"
         assert len(observations["image"].shape) > 3, "Must use observation histories"
 
-        if early_goal_concat:
-            # passing None as the goal encoder causes early goal concat
-            goal_encoder_def = None
+        if language_conditioned:
+            # Use language conditioning wrapper
+            encoder_def = LCEncodingWrapper(
+                encoder=encoder_def,
+                use_proprio=use_proprio,
+                stop_gradient=False,
+            )
         else:
-            if shared_goal_encoder:
-                goal_encoder_def = encoder_def
+            # Use goal image conditioning wrapper
+            if early_goal_concat:
+                # passing None as the goal encoder causes early goal concat
+                goal_encoder_def = None
             else:
-                goal_encoder_def = copy.deepcopy(encoder_def)
+                if shared_goal_encoder:
+                    goal_encoder_def = encoder_def
+                else:
+                    goal_encoder_def = copy.deepcopy(encoder_def)
 
-        encoder_def = GCEncodingWrapper(
-            encoder=encoder_def,
-            goal_encoder=goal_encoder_def,
-            use_proprio=use_proprio,
-            stop_gradient=False,
-        )
+            encoder_def = GCEncodingWrapper(
+                encoder=encoder_def,
+                goal_encoder=goal_encoder_def,
+                use_proprio=use_proprio,
+                stop_gradient=False,
+            )
 
         networks = {
             "actor": ScoreActor(

@@ -73,6 +73,7 @@ def get_config(config_string):
                     relabel_actions=False,
                     act_pred_horizon=4,
                     obs_horizon=1,
+                    load_susie_goal_images=False,
                     **base_data_config,
                 ),
                 text_processor="muse_embedding",

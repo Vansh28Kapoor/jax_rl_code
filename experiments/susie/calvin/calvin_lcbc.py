@@ -127,7 +127,15 @@ def main(_):
         return batch
     train_data_iter = map(shard_fn, map(process_text, train_data.tf_dataset.as_numpy_iterator()))
 
-    example_batch = next(train_data_iter)
+    # Debug: Check shapes
+    train_batch = next(train_data_iter)
+    print(f"Training image shape: {train_batch['observations']['image'].shape}")
+    
+    val_data_iter = map(shard_fn, map(process_text, val_data.tf_dataset.as_numpy_iterator()))
+    val_batch = next(val_data_iter)  
+    print(f"Validation image shape: {val_batch['observations']['image'].shape}")
+
+    example_batch = train_batch
     logging.info(f"Batch size: {example_batch['observations']['image'].shape[0]}")
     logging.info(f"Number of devices: {num_devices}")
     logging.info(
