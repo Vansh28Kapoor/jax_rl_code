@@ -13,7 +13,7 @@ from flax.core import FrozenDict
 from jaxrl_m.common.typing import Batch
 from jaxrl_m.common.typing import PRNGKey
 from jaxrl_m.common.common import JaxRLTrainState, ModuleDict, nonpytree_field
-from jaxrl_m.common.encoding import GCEncodingWrapper, LCEncodingWrapper
+from jaxrl_m.common.encoding import GCEncodingWrapper, LCEncodingWrapper, Imaginations_LCEncodingWrapper, Imaginations_LCEncodingWrapper_Attention
 
 from jaxrl_m.networks.diffusion_nets import (
     FourierFeatures,
@@ -181,6 +181,9 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         # Model architecture
         encoder_def: nn.Module,
         language_conditioned: bool = False,
+        imagination_augmented: bool = False,
+        use_attention_in_imagination: bool = False,
+        num_similar_instructions_used: int = 2,
         shared_goal_encoder: bool = True,
         early_goal_concat: bool = False,
         use_proprio: bool = False,
@@ -206,12 +209,29 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         assert len(observations["image"].shape) > 3, "Must use observation histories"
 
         if language_conditioned:
-            # Use language conditioning wrapper
-            encoder_def = LCEncodingWrapper(
-                encoder=encoder_def,
-                use_proprio=use_proprio,
-                stop_gradient=False,
-            )
+            if not imagination_augmented:
+                # Use language conditioning wrapper
+                encoder_def = LCEncodingWrapper(
+                    encoder=encoder_def,
+                    use_proprio=use_proprio,
+                    stop_gradient=False,
+                )
+            else:
+                if use_attention_in_imagination:
+                    # Use imagination-augmented LCEncodingWrapper with attention
+                    encoder_def = Imaginations_LCEncodingWrapper_Attention(
+                        encoder=encoder_def,
+                        use_proprio=use_proprio,
+                        stop_gradient=False,
+                        num_similar_instructions_used=num_similar_instructions_used
+                    )
+                else:
+                    encoder_def = Imaginations_LCEncodingWrapper(
+                        encoder=encoder_def,
+                        use_proprio=use_proprio,
+                        stop_gradient=False,
+                        num_similar_instructions_used=num_similar_instructions_used
+                    )    
         else:
             # Use goal image conditioning wrapper
             if early_goal_concat:
@@ -229,7 +249,8 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                 use_proprio=use_proprio,
                 stop_gradient=False,
             )
-
+        ## TODO: define Imagination_ScoreActor for imagination-augmented LCEncodingWrapper
+        # lang embedding = 512
         networks = {
             "actor": ScoreActor(
                 encoder_def,

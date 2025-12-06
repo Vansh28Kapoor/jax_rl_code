@@ -8,6 +8,10 @@ from absl import logging
 from jaxrl_m.data.tf_augmentations import augment
 from jaxrl_m.data.tf_goal_relabeling import GOAL_RELABELING_FUNCTIONS
 
+# Maximum number of similar instructions across all tasks
+# This is used for padding to ensure consistent batch shapes
+MAX_SIMILAR_INSTRUCTIONS = 6
+
 
 def glob_to_path_list(
     glob_strs: Union[str, List[str]], prefix: str = "", exclude: Iterable[str] = ()
@@ -95,6 +99,7 @@ class CalvinDataset:
         obs_horizon: Optional[int] = None,
         load_language: bool = False,
         load_susie_goal_images: bool = False,
+        load_img_similar_instruct: bool = False,
         skip_unlabeled: bool = False,
         **kwargs,
     ):
@@ -119,12 +124,15 @@ class CalvinDataset:
         self.obs_horizon = obs_horizon
         self.is_train = train
         self.load_susie_goal_images = load_susie_goal_images
+        self.load_img_similar_instruct = load_img_similar_instruct
         self.load_language = load_language
 
         if self.load_language:
             self.PROTO_TYPE_SPEC["language_annotation"] = tf.string
-        if self.load_susie_goal_images:
+        if self.load_susie_goal_images or self.load_img_similar_instruct:
             self.PROTO_TYPE_SPEC["susie_goal_images"] = tf.uint8
+        if self.load_img_similar_instruct:
+            self.PROTO_TYPE_SPEC["similar_instructions"] = tf.string
 
         # construct a dataset for each sub-list of paths
         datasets = []
@@ -208,26 +216,32 @@ class CalvinDataset:
 
     # the expected type spec for the serialized examples
     PROTO_TYPE_SPEC = {
-        "actions": tf.float32,
+        "actions": tf.float32,     
         "proprioceptive_states": tf.float32,
         "image_states": tf.uint8,
     }
-
+    # @tf.autograph.experimental.do_not_convert
     def _decode_example(self, example_proto):
         # decode the example proto according to PROTO_TYPE_SPEC
         features = {
-            key: tf.io.FixedLenFeature([], tf.string)
+            key: (tf.io.VarLenFeature(tf.string) if key == "similar_instructions" 
+                  else tf.io.FixedLenFeature([], tf.string))
             for key in self.PROTO_TYPE_SPEC.keys()
         }
         parsed_features = tf.io.parse_single_example(example_proto, features)
         parsed_tensors = {}
         for key, dtype in self.PROTO_TYPE_SPEC.items():
             if dtype == tf.string:
-                parsed_tensors[key] = parsed_features[key]
+                if key == "similar_instructions":
+                    # Handle sparse tensor for list of strings
+                    parsed_tensors[key] = tf.sparse.to_dense(parsed_features[key], default_value=b'')
+                else:
+                    parsed_tensors[key] = parsed_features[key]
             else:
                 parsed_tensors[key] = tf.io.parse_tensor(parsed_features[key], dtype)
-        # restructure the dictionary into the downstream format
-        return {
+        
+        # Handle susie_goal_images shape based on load_img_similar_instruct
+        result = {
             "observations": {
                 "image": parsed_tensors["image_states"][:-1],
                 "proprio": parsed_tensors["proprioceptive_states"][:-1],
@@ -239,8 +253,18 @@ class CalvinDataset:
             **({"language": parsed_tensors["language_annotation"]} if self.load_language else {}),
             "actions": parsed_tensors["actions"][:-1],
             "terminals": tf.zeros_like(parsed_tensors["actions"][:-1][:, 0:1], dtype=tf.bool),
-            **({"susie_goal_images": parsed_tensors["susie_goal_images"][:-1]} if self.load_susie_goal_images else {}),
         }
+        
+        if self.load_img_similar_instruct:
+            # Shape: (num_similar_instructions, traj_len, H, W, C)
+            # Slice off last timestep: (num_similar_instructions, traj_len-1, H, W, C)
+            result["susie_goal_images"] = parsed_tensors["susie_goal_images"][:, :-1]
+            result["similar_instructions"] = parsed_tensors["similar_instructions"]
+        elif self.load_susie_goal_images:
+            # Shape: (traj_len, H, W, C) - single goal image per timestep
+            result["susie_goal_images"] = parsed_tensors["susie_goal_images"][:-1]
+        
+        return result
 
     def _process_actions(self, traj):
         # normalize actions and proprio
@@ -279,8 +303,9 @@ class CalvinDataset:
 
         return traj
 
+    # @tf.autograph.experimental.do_not_convert
     def _chunk_act_obs(self, traj):
-        traj_len = len(traj["actions"])
+        traj_len = tf.shape(traj["actions"])[0]
         if self.act_pred_horizon is not None:
             chunk_indices = tf.broadcast_to(
                 tf.range(self.act_pred_horizon), [traj_len, self.act_pred_horizon]
@@ -304,21 +329,22 @@ class CalvinDataset:
             traj["next_obs_chunks"] = tf.nest.map_structure(
                 lambda x: tf.gather(x, chunk_indices), traj["next_observations"]
             )
-            if self.load_susie_goal_images:
-                # Fix: Use tf.shape() instead of .shape for dynamic shapes
-                goal_shape = tf.shape(traj["susie_goal_images"])
-                # Create the broadcast shape dynamically
-                broadcast_shape = tf.concat([
-                    [traj_len, self.obs_horizon],
-                    goal_shape[1:]  # This works with tf.shape()
-                ], axis=0)
-                
-                traj["susie_goal_images"] = tf.broadcast_to(
-                    traj["susie_goal_images"][:, tf.newaxis, ...],
-                    broadcast_shape
-                )
+            if self.load_img_similar_instruct:
+                    # Shape: (num_similar_instructions, traj_len, H, W, C)
+                    # Transpose to: (traj_len, num_similar_instructions, H, W, C)
+                    transposed = tf.transpose(traj["susie_goal_images"], [1, 0, 2, 3, 4])
+                    
+                    # Use tf.gather to chunk along traj_len dimension, same as observations
+                    # Result: (traj_len, obs_horizon, num_similar_instructions, H, W, C)
+                    traj["susie_goal_images"] = tf.gather(transposed, chunk_indices)
+            elif self.load_susie_goal_images:
+                # Original single goal image case: (traj_len, H, W, C)
+                # Use tf.gather to chunk along traj_len dimension
+                # Result: (traj_len, obs_horizon, H, W, C)
+                traj["susie_goal_images"] = tf.gather(traj["susie_goal_images"], chunk_indices)
         return traj
 
+    # @tf.autograph.experimental.do_not_convert
     def _add_goals(self, traj):
         if self.load_language:
             lang = traj["language"]
@@ -336,6 +362,51 @@ class CalvinDataset:
                 lang, tf.shape(traj["terminals"])
             )
             traj.pop("language")
+
+            # Handle similar_instructions padding and concatenation
+            if self.load_img_similar_instruct and "similar_instructions" in traj:
+                # Pad similar_instructions to MAX_SIMILAR_INSTRUCTIONS
+                num_similar = tf.shape(traj["similar_instructions"])[0]
+                num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
+                padding = tf.fill([num_to_pad], b'')
+                padded_similar = tf.concat([traj["similar_instructions"], padding],axis=0)
+                # if num_to_pad > 0:
+                #     # Pad with empty strings
+                #     padding = tf.fill([num_to_pad], b'')
+                #     padded_similar = tf.concat([traj["similar_instructions"], padding], axis=0)
+                # else:
+                #     padded_similar = traj["similar_instructions"]
+                
+                # Concatenate language with similar_instructions
+                # Shape: (MAX_SIMILAR_INSTRUCTIONS+1,) where index 0 is original language
+                traj["goals"]["language_with_similar"] = tf.concat([
+                    lang[tf.newaxis],  # Original language instruction
+                    padded_similar     # Similar instructions (with padding)
+                ], axis=0)
+                
+                # Broadcast to match trajectory length
+                # Shape: (traj_len, MAX_SIMILAR_INSTRUCTIONS+1)
+                traj["goals"]["language_with_similar"] = tf.broadcast_to(
+                    traj["goals"]["language_with_similar"],
+                    [tf.shape(traj["terminals"])[0], MAX_SIMILAR_INSTRUCTIONS + 1]
+                )
+                
+                # Create validity mask for susie goals
+                # Shape: (MAX_SIMILAR_INSTRUCTIONS+1,)
+                valid_mask = tf.concat([
+                    tf.ones([1], dtype=tf.float32),  # Original instruction is always valid
+                    tf.concat([
+                        tf.ones([num_similar], dtype=tf.float32),  # Real similar instructions
+                        tf.zeros([num_to_pad], dtype=tf.float32)   # Padding
+                    ], axis=0)
+                ], axis=0)
+                
+                # Broadcast to match trajectory length
+                # Shape: (traj_len, MAX_SIMILAR_INSTRUCTIONS+1)
+                traj["goals"]["susie_goal_valid_mask"] = tf.broadcast_to(
+                    valid_mask,
+                    [tf.shape(traj["terminals"])[0], MAX_SIMILAR_INSTRUCTIONS + 1]
+                )
 
             # always make the "goal" the last obs so that masking is done
             # properly below
@@ -389,17 +460,23 @@ class CalvinDataset:
             traj["next_observations"] = traj.pop("next_obs_chunks")
 
         return traj
-
+    
+    # @tf.autograph.experimental.do_not_convert
     def _augment(self, seed, image):
+        breakpoint()
+        tf.print("Seed:", seed)
+        tf.print("Obs image shape:", tf.shape(image["observations"]["image"]))
+        tf.print("Next obs image shape:", tf.shape(image["next_observations"]["image"]))
+        tf.print("Goal image keys:", image.get("goals", {}).keys() if "goals" in image else "no goals")
         if self.augment_next_obs_goal_differently:
             sub_seeds = tf.unstack(
                 tf.random.stateless_uniform(
-                    [3, 2], seed=[seed, seed], minval=None, maxval=None, dtype=tf.int32
+                    [4, 2], seed=[seed, seed], minval=None, maxval=None, dtype=tf.int32
                 )
             )
         else:
             # use the same seed for obs, next_obs, and goal
-            sub_seeds = [[seed, seed]] * 3
+            sub_seeds = [[seed, seed]] * 4
 
         for key, sub_seed in zip(
             ["observations", "next_observations", "goals"], sub_seeds
@@ -409,10 +486,64 @@ class CalvinDataset:
             )
         
         # AFTER augmentation, concatenate susie goal images
-        if self.load_susie_goal_images and "susie_goal_images" in image:
+        if self.load_img_similar_instruct:
+            assert "susie_goal_images" in image, "susie_goal_images key missing in image dict"
+            # Shape: (obs_horizon, num_similar_instructions, H, W, C)
+            obs_h = tf.shape(image["susie_goal_images"])[0]
+            num_similar = tf.shape(image["susie_goal_images"])[1]
+            goal_shape = tf.shape(image["susie_goal_images"])
+            H, W, C = goal_shape[2], goal_shape[3], goal_shape[4]
+            
+            # Pad to MAX_SIMILAR_INSTRUCTIONS if needed
+            num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
+            padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
+            padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
+            
+            # num_to_pad = MAX_SIMILAR_INSTRUCTIONS - num_similar
+            # if num_to_pad > 0:
+            #     # Create zero padding: (obs_horizon, num_to_pad, H, W, C)
+            #     padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
+            #     padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
+            # else:
+            #     padded_goals = image["susie_goal_images"]
+            
+
+            
+            # Apply same augmentation to all similar instruction goals
+            # Reshape to (obs_horizon * MAX_SIMILAR_INSTRUCTIONS, H, W, C)
+            reshaped_goals = tf.reshape(
+                padded_goals,
+                [obs_h * MAX_SIMILAR_INSTRUCTIONS, H, W, C]
+            )
+            
+            # Apply augmentation
+            augmented_goals = augment(
+                reshaped_goals, sub_seeds[-1], **self.augment_kwargs
+            )
+            
+            # Reshape back to (obs_horizon, MAX_SIMILAR_INSTRUCTIONS, H, W, C)
+            augmented_goals = tf.reshape(
+                augmented_goals,
+                [obs_h, MAX_SIMILAR_INSTRUCTIONS, H, W, C]
+            )
+            
+            # Add extra dimension to observations: (obs_horizon, H, W, C) -> (obs_horizon, 1, H, W, C)
+            obs_with_dim = image["observations"]["image"][:, tf.newaxis, ...]
+            
+            # Concatenate along axis=1 to get (obs_horizon, MAX_SIMILAR_INSTRUCTIONS+1, H, W, C)
+            # First element is original observation, rest are SUSIE goals (including padding)
+            image["observations"]["image"] = tf.concat([
+                obs_with_dim,
+                augmented_goals
+            ], axis=1)
+            
+            # Remove the separate susie_goal_images tensor
+            image.pop("susie_goal_images")
+        elif self.load_susie_goal_images:
+            # Original single goal image case
             # Apply same augmentation to susie goal images
             image["susie_goal_images"] = augment(
-                image["susie_goal_images"], sub_seeds[0], **self.augment_kwargs
+                image["susie_goal_images"], sub_seeds[-1], **self.augment_kwargs
             )
             
             # Now concatenate the augmented images
@@ -424,15 +555,49 @@ class CalvinDataset:
             # Remove the separate susie_goal_images tensor
             image.pop("susie_goal_images")
         return image
-
+    # @tf.autograph.experimental.do_not_convert
     def susie_concat(self, image):
         if self.load_susie_goal_images and "susie_goal_images" in image:
-            image["observations"]["image"] = tf.concat([
+            if self.load_img_similar_instruct:
+                # Shape: (obs_horizon, num_similar_instructions, H, W, C)
+                obs_h = tf.shape(image["susie_goal_images"])[0]
+                num_similar = tf.shape(image["susie_goal_images"])[1]
+                goal_shape = tf.shape(image["susie_goal_images"])
+                H, W, C = goal_shape[2], goal_shape[3], goal_shape[4]
+                
+                # Pad to MAX_SIMILAR_INSTRUCTIONS if needed
+                num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
+                padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
+                padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
+                
+                # num_to_pad = MAX_SIMILAR_INSTRUCTIONS - num_similar
+                # if num_to_pad > 0:
+                #     # Create zero padding: (obs_horizon, num_to_pad, H, W, C)
+                #     padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
+                #     padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
+                # else:
+                #     padded_goals = image["susie_goal_images"]
+                
+                
+                # Add extra dimension to observations: (obs_horizon, H, W, C) -> (obs_horizon, 1, H, W, C)
+                obs_with_dim = image["observations"]["image"][:, tf.newaxis, ...]
+                
+                # Concatenate along axis=1 to get (obs_horizon, MAX_SIMILAR_INSTRUCTIONS+1, H, W, C)
+                # First element is original observation, rest are SUSIE goals (including padding)
+                image["observations"]["image"] = tf.concat([
+                    obs_with_dim,
+                    padded_goals
+                ], axis=1)
+                
+                image.pop("susie_goal_images")
+            else:
+                # Original single goal image case
+                image["observations"]["image"] = tf.concat([
                     image["observations"]["image"], 
                     image["susie_goal_images"]
                 ], axis=-1)
                 
-            image.pop("susie_goal_images")
+                image.pop("susie_goal_images")
         return image
 
     def iterator(self):

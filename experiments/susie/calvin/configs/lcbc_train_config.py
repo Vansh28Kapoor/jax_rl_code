@@ -52,6 +52,9 @@ def get_config(config_string):
                         use_layer_norm=True,
                     ),
                     language_conditioned=True,
+                    imagination_augmented=False,
+                    use_attention_in_imagination=False,
+                    num_similar_instructions_used=2,
                     early_goal_concat=None,
                     shared_goal_encoder=None,
                     use_proprio=False,
@@ -74,6 +77,8 @@ def get_config(config_string):
                     act_pred_horizon=4,
                     obs_horizon=1,
                     load_susie_goal_images=False,
+                    load_img_similar_instruct = False,
+                    
                     **base_data_config,
                 ),
                 text_processor="muse_embedding",

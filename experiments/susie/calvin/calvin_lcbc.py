@@ -1,10 +1,15 @@
 import os
+os.environ["WANDB_MODE"] = "disabled"
+os.environ["WANDB_DISABLED"] = "true"    # extra safety
+os.environ["WANDB_DIR"] = "/tmp/wandb" 
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
+# tf.data.experimental.enable_debug_mode()
+# tf.config.run_functions_eagerly(True)
 import tqdm
 from absl import app, flags, logging
 from flax.training import checkpoints
@@ -17,7 +22,6 @@ from jaxrl_m.data.calvin_dataset import CalvinDataset, glob_to_path_list
 from jaxrl_m.utils.timer_utils import Timer
 from jaxrl_m.vision import encoders
 from jaxrl_m.data.text_processing import text_processors
-
 try:
     from jax_smi import initialise_tracking  # type: ignore
 
@@ -44,6 +48,11 @@ config_flags.DEFINE_config_file(
     lock_config=False,
 )
 
+def get_shape(x):
+    if isinstance(x, list):
+        if not x: return (0,)
+        return (len(x), *get_shape(x[0]))
+    return ()
 
 def main(_):
     devices = jax.local_devices()
@@ -90,7 +99,6 @@ def main(_):
     val_paths = [task_paths[1]]
 
     obs_horizon = FLAGS.config.get("obs_horizon")
-
     train_data = CalvinDataset(
         train_paths,
         FLAGS.config.seed,
@@ -116,14 +124,31 @@ def main(_):
             **FLAGS.config.text_processor_kwargs
         )
 
+    # def process_text(batch):
+    #     if text_processor is None:
+    #         batch["goals"].pop("language")
+    #     else:
+    #         batch["goals"]["language"] = text_processor.encode(
+    #             #[s.decode("utf-8") for s in batch["goals"]["language"]]
+    #             [s for s in batch["goals"]["language"]]
+    #         )
+    #     return batch
     def process_text(batch):
         if text_processor is None:
             batch["goals"].pop("language")
         else:
-            batch["goals"]["language"] = text_processor.encode(
-                #[s.decode("utf-8") for s in batch["goals"]["language"]]
-                [s for s in batch["goals"]["language"]]
-            )
+            lang = batch["goals"]["language"]
+            shape = get_shape(lang)
+
+            if len(shape) == 1:
+                enc = text_processor.encode(lang)
+            elif len(shape) == 2:
+                flat = [s for sub in lang for s in sub]
+                enc = text_processor.encode(flat)
+                enc = enc.reshape(*shape, -1)
+            else:
+                raise ValueError(f"unexpected shape: {shape}")
+            batch["goals"]["language"] = enc
         return batch
     train_data_iter = map(shard_fn, map(process_text, train_data.tf_dataset.as_numpy_iterator()))
 
