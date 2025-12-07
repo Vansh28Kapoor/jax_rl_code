@@ -49,9 +49,17 @@ config_flags.DEFINE_config_file(
 )
 
 def get_shape(x):
+    # Handle numpy / jax arrays
+    if hasattr(x, "shape"):
+        return x.shape
+
+    # Handle plain Python lists
     if isinstance(x, list):
-        if not x: return (0,)
+        if not x:
+            return (0,)
         return (len(x), *get_shape(x[0]))
+
+    # Fallback: scalar
     return ()
 
 def main(_):
@@ -128,6 +136,7 @@ def main(_):
     #     if text_processor is None:
     #         batch["goals"].pop("language")
     #     else:
+    #         print(type(batch["goals"]["language"]))
     #         batch["goals"]["language"] = text_processor.encode(
     #             #[s.decode("utf-8") for s in batch["goals"]["language"]]
     #             [s for s in batch["goals"]["language"]]
@@ -137,18 +146,20 @@ def main(_):
         if text_processor is None:
             batch["goals"].pop("language")
         else:
-            lang = batch["goals"]["language"]
-            shape = get_shape(lang)
-
-            if len(shape) == 1:
-                enc = text_processor.encode(lang)
-            elif len(shape) == 2:
+            if not FLAGS.config.dataset_kwargs.get("load_img_similar_instruct", False):
+                batch["goals"]["language"] = text_processor.encode(batch["goals"]["language"]) ## Even here len(get_shape(batch["goals"]["language"])) is 2; (B,1)
+                print("Shape of language:", get_shape(batch["goals"]["language"]))
+            else:
+                lang = batch["goals"]["language_with_similar"]
+                shape = get_shape(lang)
+                print("Shape of language_with_similar before encoding:", shape)
+                assert len(shape)==2, f"unexpected shape: {shape}"
                 flat = [s for sub in lang for s in sub]
                 enc = text_processor.encode(flat)
                 enc = enc.reshape(*shape, -1)
-            else:
-                raise ValueError(f"unexpected shape: {shape}")
-            batch["goals"]["language"] = enc
+                
+                # enc  = text_processor.encode(batch["goals"]["language_with_similar"])
+                batch["goals"]["language_with_similar"] = enc
         return batch
     train_data_iter = map(shard_fn, map(process_text, train_data.tf_dataset.as_numpy_iterator()))
 

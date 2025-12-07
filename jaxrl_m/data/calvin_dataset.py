@@ -377,8 +377,8 @@ class CalvinDataset:
             if self.load_img_similar_instruct and "similar_instructions" in traj:
                 # Pad similar_instructions to MAX_SIMILAR_INSTRUCTIONS
                 num_similar = tf.shape(traj["similar_instructions"])[0]
-                # tf.print("DEBUG lang_shape:", tf.shape(lang))
-                # tf.print("DEBUG lang:", lang, output_stream=sys.stdout)
+                print("DEBUG lang_shape, similar_shape:", tf.shape(lang), tf.shape(traj["similar_instructions"]), len(traj["similar_instructions"]))
+                tf.print("DEBUG lang:", lang, output_stream=sys.stdout)
 
                 num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
                 padding = tf.fill([num_to_pad], b'')
