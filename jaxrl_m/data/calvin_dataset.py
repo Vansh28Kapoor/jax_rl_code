@@ -1,4 +1,5 @@
 import fnmatch
+import sys
 from typing import Iterable, List, Optional, Union
 
 import numpy as np
@@ -8,8 +9,7 @@ from absl import logging
 from jaxrl_m.data.tf_augmentations import augment
 from jaxrl_m.data.tf_goal_relabeling import GOAL_RELABELING_FUNCTIONS
 
-# Maximum number of similar instructions across all tasks
-# This is used for padding to ensure consistent batch shapes
+
 MAX_SIMILAR_INSTRUCTIONS = 6
 
 
@@ -170,7 +170,7 @@ class CalvinDataset:
         else:
             # even if not augmenting, we may need to concat susie goal images
             dataset = dataset.map(self.susie_concat, num_parallel_calls=tf.data.AUTOTUNE)
-
+        
         dataset = dataset.batch(
             batch_size,
             num_parallel_calls=tf.data.AUTOTUNE,
@@ -330,13 +330,23 @@ class CalvinDataset:
                 lambda x: tf.gather(x, chunk_indices), traj["next_observations"]
             )
             if self.load_img_similar_instruct:
-                    # Shape: (num_similar_instructions, traj_len, H, W, C)
-                    # Transpose to: (traj_len, num_similar_instructions, H, W, C)
-                    transposed = tf.transpose(traj["susie_goal_images"], [1, 0, 2, 3, 4])
+                num_similar = tf.shape(traj["susie_goal_images"])[0]
+                traj_len = tf.shape(traj["susie_goal_images"])[1]
+                H, W, C = tf.shape(traj["susie_goal_images"])[2], tf.shape(traj["susie_goal_images"])[3], tf.shape(traj["susie_goal_images"])[4]
+                
+                # Pad to MAX_SIMILAR_INSTRUCTIONS if needed
+                num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
+                padding = tf.zeros([num_to_pad, traj_len, H, W, C], dtype=traj["susie_goal_images"].dtype)
+                padded_goals = tf.concat([traj["susie_goal_images"], padding], axis=0)
                     
-                    # Use tf.gather to chunk along traj_len dimension, same as observations
-                    # Result: (traj_len, obs_horizon, num_similar_instructions, H, W, C)
-                    traj["susie_goal_images"] = tf.gather(transposed, chunk_indices)
+                
+                # Shape: (num_similar_instructions, traj_len, H, W, C)
+                # Transpose to: (traj_len, num_similar_instructions, H, W, C)
+                transposed = tf.transpose(padded_goals, [1, 0, 2, 3, 4])
+                
+                # Use tf.gather to chunk along traj_len dimension, same as observations
+                # Result: (traj_len, obs_horizon, num_similar_instructions, H, W, C)
+                traj["susie_goal_images"] = tf.gather(transposed, chunk_indices)
             elif self.load_susie_goal_images:
                 # Original single goal image case: (traj_len, H, W, C)
                 # Use tf.gather to chunk along traj_len dimension
@@ -357,9 +367,9 @@ class CalvinDataset:
         )
 
         if self.load_language:
-            lang = traj["language"]
+            # lang = traj["language"]
             traj["goals"]["language"] = tf.broadcast_to(
-                lang, tf.shape(traj["terminals"])
+                traj["language"], tf.shape(traj["terminals"])
             )
             traj.pop("language")
 
@@ -367,15 +377,12 @@ class CalvinDataset:
             if self.load_img_similar_instruct and "similar_instructions" in traj:
                 # Pad similar_instructions to MAX_SIMILAR_INSTRUCTIONS
                 num_similar = tf.shape(traj["similar_instructions"])[0]
+                # tf.print("DEBUG lang_shape:", tf.shape(lang))
+                # tf.print("DEBUG lang:", lang, output_stream=sys.stdout)
+
                 num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
                 padding = tf.fill([num_to_pad], b'')
                 padded_similar = tf.concat([traj["similar_instructions"], padding],axis=0)
-                # if num_to_pad > 0:
-                #     # Pad with empty strings
-                #     padding = tf.fill([num_to_pad], b'')
-                #     padded_similar = tf.concat([traj["similar_instructions"], padding], axis=0)
-                # else:
-                #     padded_similar = traj["similar_instructions"]
                 
                 # Concatenate language with similar_instructions
                 # Shape: (MAX_SIMILAR_INSTRUCTIONS+1,) where index 0 is original language
@@ -384,6 +391,9 @@ class CalvinDataset:
                     padded_similar     # Similar instructions (with padding)
                 ], axis=0)
                 
+                tf.print("DEBUG _add_goals: language_with_similar shape before broadcast:", 
+                        tf.shape(traj["goals"]["language_with_similar"]), 
+                        output_stream=sys.stdout)
                 # Broadcast to match trajectory length
                 # Shape: (traj_len, MAX_SIMILAR_INSTRUCTIONS+1)
                 traj["goals"]["language_with_similar"] = tf.broadcast_to(
@@ -463,11 +473,6 @@ class CalvinDataset:
     
     # @tf.autograph.experimental.do_not_convert
     def _augment(self, seed, image):
-        breakpoint()
-        tf.print("Seed:", seed)
-        tf.print("Obs image shape:", tf.shape(image["observations"]["image"]))
-        tf.print("Next obs image shape:", tf.shape(image["next_observations"]["image"]))
-        tf.print("Goal image keys:", image.get("goals", {}).keys() if "goals" in image else "no goals")
         if self.augment_next_obs_goal_differently:
             sub_seeds = tf.unstack(
                 tf.random.stateless_uniform(
@@ -488,31 +493,17 @@ class CalvinDataset:
         # AFTER augmentation, concatenate susie goal images
         if self.load_img_similar_instruct:
             assert "susie_goal_images" in image, "susie_goal_images key missing in image dict"
-            # Shape: (obs_horizon, num_similar_instructions, H, W, C)
+            # Shape: (obs_horizon, MAX_SIMILAR_INSTRUCTIONS, H, W, C)
             obs_h = tf.shape(image["susie_goal_images"])[0]
-            num_similar = tf.shape(image["susie_goal_images"])[1]
             goal_shape = tf.shape(image["susie_goal_images"])
             H, W, C = goal_shape[2], goal_shape[3], goal_shape[4]
-            
-            # Pad to MAX_SIMILAR_INSTRUCTIONS if needed
-            num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
-            padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
-            padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
-            
-            # num_to_pad = MAX_SIMILAR_INSTRUCTIONS - num_similar
-            # if num_to_pad > 0:
-            #     # Create zero padding: (obs_horizon, num_to_pad, H, W, C)
-            #     padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
-            #     padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
-            # else:
-            #     padded_goals = image["susie_goal_images"]
             
 
             
             # Apply same augmentation to all similar instruction goals
             # Reshape to (obs_horizon * MAX_SIMILAR_INSTRUCTIONS, H, W, C)
             reshaped_goals = tf.reshape(
-                padded_goals,
+                image["susie_goal_images"],
                 [obs_h * MAX_SIMILAR_INSTRUCTIONS, H, W, C]
             )
             
@@ -558,26 +549,8 @@ class CalvinDataset:
     # @tf.autograph.experimental.do_not_convert
     def susie_concat(self, image):
         if self.load_susie_goal_images and "susie_goal_images" in image:
+            
             if self.load_img_similar_instruct:
-                # Shape: (obs_horizon, num_similar_instructions, H, W, C)
-                obs_h = tf.shape(image["susie_goal_images"])[0]
-                num_similar = tf.shape(image["susie_goal_images"])[1]
-                goal_shape = tf.shape(image["susie_goal_images"])
-                H, W, C = goal_shape[2], goal_shape[3], goal_shape[4]
-                
-                # Pad to MAX_SIMILAR_INSTRUCTIONS if needed
-                num_to_pad = tf.maximum(MAX_SIMILAR_INSTRUCTIONS - num_similar, 0)
-                padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
-                padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
-                
-                # num_to_pad = MAX_SIMILAR_INSTRUCTIONS - num_similar
-                # if num_to_pad > 0:
-                #     # Create zero padding: (obs_horizon, num_to_pad, H, W, C)
-                #     padding = tf.zeros([obs_h, num_to_pad, H, W, C], dtype=image["susie_goal_images"].dtype)
-                #     padded_goals = tf.concat([image["susie_goal_images"], padding], axis=1)
-                # else:
-                #     padded_goals = image["susie_goal_images"]
-                
                 
                 # Add extra dimension to observations: (obs_horizon, H, W, C) -> (obs_horizon, 1, H, W, C)
                 obs_with_dim = image["observations"]["image"][:, tf.newaxis, ...]
@@ -586,7 +559,7 @@ class CalvinDataset:
                 # First element is original observation, rest are SUSIE goals (including padding)
                 image["observations"]["image"] = tf.concat([
                     obs_with_dim,
-                    padded_goals
+                    image["susie_goal_images"]
                 ], axis=1)
                 
                 image.pop("susie_goal_images")
