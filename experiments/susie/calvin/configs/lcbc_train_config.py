@@ -11,7 +11,7 @@ def get_config(config_string):
         save_interval=2000,
         save_dir="<path to save dir>",
         data_path="<path_to_language_conditioned_dataset>",
-        resume_path=None,
+        resume_path="",
         seed=42,
     )
 

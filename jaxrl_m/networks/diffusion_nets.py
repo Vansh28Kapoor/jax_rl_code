@@ -43,7 +43,7 @@ class ScoreActor(nn.Module):
 
         t_ff = self.time_preprocess(time)
         cond_enc = self.cond_encoder(t_ff, train=train)
-        obs_enc = self.encoder(observations)
+        obs_enc = self.encoder(observations, train=train)
         reverse_input = jnp.concatenate([cond_enc, obs_enc, flat_actions], axis=-1)
         eps_pred = self.reverse_network(reverse_input, train=train)
 

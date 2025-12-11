@@ -211,6 +211,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         if language_conditioned:
             if not imagination_augmented:
                 # Use language conditioning wrapper
+                print(">>> Using LCEncodingWrapper (no imagination)")
                 encoder_def = LCEncodingWrapper(
                     encoder=encoder_def,
                     use_proprio=use_proprio,
@@ -219,6 +220,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
             else:
                 if use_attention_in_imagination:
                     # Use imagination-augmented LCEncodingWrapper with attention
+                    print(f">>> Using Imaginations_LCEncodingWrapper_Attention (use_attention_in_imagination={use_attention_in_imagination}, num_similar={num_similar_instructions_used})")
                     encoder_def = Imaginations_LCEncodingWrapper_Attention(
                         encoder=encoder_def,
                         use_proprio=use_proprio,
@@ -226,6 +228,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                         num_similar_instructions_used=num_similar_instructions_used
                     )
                 else:
+                    print(f">>> Using Imaginations_LCEncodingWrapper (no attention, num_similar={num_similar_instructions_used})")
                     encoder_def = Imaginations_LCEncodingWrapper(
                         encoder=encoder_def,
                         use_proprio=use_proprio,
@@ -272,13 +275,14 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
 
         model_def = ModuleDict(networks)
 
-        rng, init_rng = jax.random.split(rng)
+        rng, init_rng, dropout_rng = jax.random.split(rng, 3)
         if len(actions.shape) == 3:
             example_time = jnp.zeros((actions.shape[0], 1))
         else:
             example_time = jnp.zeros((1,))
         params = model_def.init(
-            init_rng, actor=[(observations, goals), actions, example_time]
+            {"params": init_rng, "dropout": dropout_rng}, 
+            actor=[(observations, goals), actions, example_time]
         )["params"]
 
         # no decay

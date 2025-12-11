@@ -21,7 +21,7 @@ class EncodingWrapper(nn.Module):
     use_proprio: bool
     stop_gradient: bool
 
-    def __call__(self, observations: Dict[str, jnp.ndarray]) -> jnp.ndarray:
+    def __call__(self, observations: Dict[str, jnp.ndarray], train: bool = False) -> jnp.ndarray:
         encoding = self.encoder(observations["image"])
         if self.use_proprio:
             encoding = jnp.concatenate([encoding, observations["proprio"]], axis=-1)
@@ -54,6 +54,7 @@ class GCEncodingWrapper(nn.Module):
     def __call__(
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
+        train: bool = False,
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -114,6 +115,7 @@ class LCEncodingWrapper(nn.Module):
     def __call__(
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
+        train: bool = False,
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -162,11 +164,12 @@ class Imaginations_LCEncodingWrapper(nn.Module):
     encoder: nn.Module
     use_proprio: bool
     stop_gradient: bool
+    num_similar_instructions_used: int = 2
 
     def __call__(
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
-        num_similar_instructions_used: int = 2,
+        train: bool = False,
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -175,7 +178,7 @@ class Imaginations_LCEncodingWrapper(nn.Module):
             batch_size, obs_horizon, total_views = observations["image"].shape[:3]
             
             # Restrict to num_similar_instructions_used + 1 (original obs + N similar instructions)
-            num_views = num_similar_instructions_used + 1
+            num_views = self.num_similar_instructions_used + 1
             obs_image_restricted = observations["image"][:, :, :num_views, :, :, :]  # (B, T, num_views, H, W, C)
             language_restricted = goals["language_with_similar"][:, :num_views, :]    # (B, num_views, E)
             mask_restricted = goals["susie_goal_valid_mask"][:, :num_views]          # (B, num_views)
@@ -202,7 +205,7 @@ class Imaginations_LCEncodingWrapper(nn.Module):
             total_views = observations["image"].shape[1]
             
             # Restrict to num_similar_instructions_used + 1 (original obs + N similar instructions)
-            num_views = num_similar_instructions_used + 1
+            num_views = self.num_similar_instructions_used + 1
             obs_image_restricted = observations["image"][:, :num_views, :, :, :]  # (B, num_views, H, W, C)
             language_restricted = goals["language_with_similar"][:, :num_views, :]  # (B, num_views, E)
             mask_restricted = goals["susie_goal_valid_mask"][:, :num_views]        # (B, num_views)
@@ -270,17 +273,18 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
     stop_gradient: bool
     attention_dim: int = 128
     dropout_rate: float = 0.1
+    num_similar_instructions_used: int = 4
 
     def setup(self):
         # Attention projection layers
         self.query_proj = nn.Dense(self.attention_dim, name="query_proj")
         self.key_proj = nn.Dense(self.attention_dim, name="key_proj")
-        self.dropout = nn.Dropout(rate=self.dropout_rate, deterministic=False)
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
         
     def __call__(
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
-        num_similar_instructions_used: int = 4,
+        train: bool = False,
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -289,7 +293,7 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
             batch_size, obs_horizon, total_views = observations["image"].shape[:3]
             
             # Restrict to num_similar_instructions_used + 1 (original obs + N similar instructions)
-            num_views = num_similar_instructions_used + 1
+            num_views = self.num_similar_instructions_used + 1
             obs_image_restricted = observations["image"][:, :, :num_views, :, :, :]  # (B, T, num_views, H, W, C)
             language_restricted = goals["language_with_similar"][:, :num_views, :]    # (B, num_views, E)
             mask_restricted = goals["susie_goal_valid_mask"][:, :num_views]          # (B, num_views)
@@ -317,7 +321,7 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
             obs_horizon = None
             
             # Restrict to num_similar_instructions_used + 1 (original obs + N similar instructions)
-            num_views = num_similar_instructions_used + 1
+            num_views = self.num_similar_instructions_used + 1
             obs_image_restricted = observations["image"][:, :num_views, :, :, :]  # (B, num_views, H, W, C)
             language_restricted = goals["language_with_similar"][:, :num_views, :]  # (B, num_views, E)
             mask_restricted = goals["susie_goal_valid_mask"][:, :num_views]        # (B, num_views)
@@ -405,8 +409,8 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
         # Apply softmax to get attention weights
         attention_weights = jax.nn.softmax(attention_scores, axis=-1)  # (B, T, num_similar) or (B, num_similar)
         
-        # Apply dropout to attention weights for regularization
-        attention_weights = self.dropout(attention_weights)
+        # Apply dropout to attention weights for regularization (only active during training)
+        attention_weights = self.dropout(attention_weights, deterministic=not train)
         
         # Apply attention weights to similar encodings (values)
         if obs_horizon is not None:

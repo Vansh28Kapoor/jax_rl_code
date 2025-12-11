@@ -3,6 +3,7 @@ os.environ["WANDB_MODE"] = "disabled"
 os.environ["WANDB_DISABLED"] = "true"    # extra safety
 os.environ["WANDB_DIR"] = "/tmp/wandb" 
 from functools import partial
+import re
 
 import jax
 import jax.numpy as jnp
@@ -88,11 +89,18 @@ def main(_):
         debug=FLAGS.debug,
     )
 
-    save_dir = tf.io.gfile.join(
-        FLAGS.config.save_dir,
-        wandb_logger.config.project,
-        f"{wandb_logger.config.exp_descriptor}_{wandb_logger.config.unique_identifier}",
-    )
+    # Determine save directory - use resume path's directory if resuming
+    if FLAGS.config.resume_path and FLAGS.config.resume_path != "":
+        # Extract directory from checkpoint path (remove /checkpoint_XXX)
+        save_dir = os.path.dirname(FLAGS.config.resume_path)
+        logging.info(f"Resuming - will save to existing directory: {save_dir}")
+    else:
+        save_dir = tf.io.gfile.join(
+            FLAGS.config.save_dir,
+            wandb_logger.config.project,
+            f"{wandb_logger.config.exp_descriptor}_{wandb_logger.config.unique_identifier}",
+        )
+        logging.info(f"Starting new training - will save to: {save_dir}")
 
     # load datasets
     assert type(FLAGS.calvin_dataset_config.include[0]) == list
@@ -150,9 +158,9 @@ def main(_):
                 batch["goals"]["language"] = text_processor.encode(batch["goals"]["language"]) ## Even here len(get_shape(batch["goals"]["language"])) is 2; (B,1)
                 print("Shape of language:", get_shape(batch["goals"]["language"]))
             else:
+                batch["goals"]["language"] = text_processor.encode(batch["goals"]["language"]) ## Even here len(get_shape(batch["goals"]["language"])) is 2; (B,1)
                 lang = batch["goals"]["language_with_similar"]
                 shape = get_shape(lang)
-                print("Shape of language_with_similar before encoding:", shape)
                 assert len(shape)==2, f"unexpected shape: {shape}"
                 flat = [s for sub in lang for s in sub]
                 enc = text_processor.encode(flat)
@@ -192,14 +200,24 @@ def main(_):
         encoder_def=encoder_def,
         **FLAGS.config.agent_kwargs,
     )
-    if FLAGS.config.resume_path is not None:
+    
+    start_step = 0
+    if FLAGS.config.resume_path and FLAGS.config.resume_path != "":
         agent = checkpoints.restore_checkpoint(FLAGS.config.resume_path, target=agent)
+        # Extract step number from checkpoint path
+        match = re.search(r'checkpoint_(\d+)', FLAGS.config.resume_path)
+        if match:
+            start_step = int(match.group(1))
+            logging.info(f"Resuming training from step {start_step}")
+        else:
+            logging.warning(f"Could not extract step number from {FLAGS.config.resume_path}, starting from 0")
+    
     # replicate agent across devices
     # need the jnp.array to avoid a bug where device_put doesn't recognize primitives
     agent = jax.device_put(jax.tree_map(jnp.array, agent), sharding.replicate())
 
     timer = Timer()
-    for i in tqdm.tqdm(range(int(FLAGS.config.num_steps))):
+    for i in tqdm.tqdm(range(start_step, int(FLAGS.config.num_steps))):
         timer.tick("total")
 
         timer.tick("dataset")
