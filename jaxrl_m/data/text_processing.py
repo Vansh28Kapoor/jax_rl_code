@@ -50,8 +50,22 @@ class MuseEmbedding(TextProcessor):
     def __init__(self):
         import tensorflow_hub as hub  # lazy import
         import tensorflow_text  # required for muse
+        import os
+        import shutil
 
-        self.muse_model = hub.load(MULTI_MODULE)
+        try:
+            self.muse_model = hub.load(MULTI_MODULE)
+        except ValueError as e:
+            if "incompatible/unknown type" in str(e) or "saved_model.pb" in str(e):
+                # Clear corrupted cache and retry
+                cache_dir = os.path.join(os.environ.get('TFHUB_CACHE_DIR', '/tmp/tfhub_modules'))
+                print(f"Corrupted TensorFlow Hub cache detected. Clearing {cache_dir}...")
+                if os.path.exists(cache_dir):
+                    shutil.rmtree(cache_dir)
+                    print(f"Cache cleared. Re-downloading model...")
+                self.muse_model = hub.load(MULTI_MODULE)
+            else:
+                raise
 
     def encode(self, strings):
         with tf.device("/cpu:0"):
