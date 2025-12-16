@@ -37,18 +37,33 @@ class ScoreActor(nn.Module):
     cond_encoder: nn.Module
     reverse_network: nn.Module
 
-    def __call__(self, observations, actions, time, train=False):
+    def __call__(self, observations, actions, time, train=False, return_attention_weights=False):
         # flatten actions
         flat_actions = actions.reshape([actions.shape[0], -1])
 
         t_ff = self.time_preprocess(time)
         cond_enc = self.cond_encoder(t_ff, train=train)
-        obs_enc = self.encoder(observations, train=train)
+        
+        # Call encoder - it may return (encoding, attention_weights) if return_attention_weights is enabled
+        encoder_output = self.encoder(observations, train=train, return_attention_weights=return_attention_weights)
+        
+        # Check if encoder returned attention weights
+        if isinstance(encoder_output, tuple):
+            obs_enc, attention_weights = encoder_output
+        else:
+            obs_enc = encoder_output
+            attention_weights = None
+            
         reverse_input = jnp.concatenate([cond_enc, obs_enc, flat_actions], axis=-1)
         eps_pred = self.reverse_network(reverse_input, train=train)
 
         # un-flatten pred sequence
-        return eps_pred.reshape(actions.shape)
+        eps_pred_reshaped = eps_pred.reshape(actions.shape)
+        
+        if return_attention_weights and attention_weights is not None:
+            return eps_pred_reshaped, attention_weights
+        else:
+            return eps_pred_reshaped
 
 
 class FourierFeatures(nn.Module):

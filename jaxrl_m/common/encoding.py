@@ -21,7 +21,7 @@ class EncodingWrapper(nn.Module):
     use_proprio: bool
     stop_gradient: bool
 
-    def __call__(self, observations: Dict[str, jnp.ndarray], train: bool = False) -> jnp.ndarray:
+    def __call__(self, observations: Dict[str, jnp.ndarray], train: bool = False, **kwargs) -> jnp.ndarray:
         encoding = self.encoder(observations["image"])
         if self.use_proprio:
             encoding = jnp.concatenate([encoding, observations["proprio"]], axis=-1)
@@ -55,6 +55,7 @@ class GCEncodingWrapper(nn.Module):
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
         train: bool = False,
+        **kwargs
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -116,6 +117,7 @@ class LCEncodingWrapper(nn.Module):
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
         train: bool = False,
+        **kwargs
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -170,6 +172,7 @@ class Imaginations_LCEncodingWrapper(nn.Module):
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
         train: bool = False,
+        **kwargs
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
 
@@ -285,8 +288,10 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
         self,
         observations_and_goals: Tuple[Dict[str, jnp.ndarray], Dict[str, jnp.ndarray]],
         train: bool = False,
+        **kwargs
     ) -> jnp.ndarray:
         observations, goals = observations_and_goals
+        return_attention_weights = kwargs.get('return_attention_weights', False)
 
         if len(observations["image"].shape) == 6:
             # obs history case: (B, T, I_total, H, W, C)
@@ -437,7 +442,10 @@ class Imaginations_LCEncodingWrapper_Attention(nn.Module):
         if self.stop_gradient:
             combined_encoding = jax.lax.stop_gradient(combined_encoding)
 
-        return combined_encoding
+        if return_attention_weights:
+            return combined_encoding, attention_weights
+        else:
+            return combined_encoding
     
 # class Imaginations_LCEncodingWrapper(nn.Module):
 #     """

@@ -89,7 +89,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
 
         return self.replace(state=new_state), info
 
-    @partial(jax.jit, static_argnames="argmax")
+    @partial(jax.jit, static_argnames=("argmax", "return_attention_weights")) ## Train is automatically false here since .apply_fn is not passed train arg
     def sample_actions(
         self,
         observations: np.ndarray,
@@ -99,6 +99,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         temperature: float = 1.0,
         argmax: bool = False,
         clip_sampler: bool = True,
+        return_attention_weights: bool = False,
     ) -> jnp.ndarray:
         assert len(observations["image"].shape) > 3, "Must use observation histories"
 
@@ -106,13 +107,21 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
             current_x, rng = input_tuple
             input_time = jnp.broadcast_to(time, (current_x.shape[0], 1))
 
-            eps_pred = self.state.apply_fn(
+            actor_output = self.state.apply_fn(
                 {"params": self.state.target_params},
                 (observations, goals),
                 current_x,
                 input_time,
+                return_attention_weights=return_attention_weights,
                 name="actor",
             )
+            
+            # Handle potential attention weights return
+            if return_attention_weights and isinstance(actor_output, tuple):
+                eps_pred, attn_weights = actor_output
+            else:
+                eps_pred = actor_output
+                attn_weights = None
 
             alpha_1 = 1 / jnp.sqrt(self.config["alphas"][time])
             alpha_2 = (1 - self.config["alphas"][time]) / (
@@ -132,7 +141,10 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                     current_x, self.config["action_min"], self.config["action_max"]
                 )
 
-            return (current_x, rng), ()
+            if return_attention_weights:
+                return (current_x, rng), attn_weights
+            else:
+                return (current_x, rng), ()
 
         key, rng = jax.random.split(seed)
 
@@ -144,22 +156,30 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         else:
             batch_size = observations["image"].shape[0]
 
-        input_tuple, () = jax.lax.scan(
+        input_tuple, scan_output = jax.lax.scan(
             fn,
             (jax.random.normal(key, (batch_size, *self.config["action_dim"])), rng),
             jnp.arange(self.config["diffusion_steps"] - 1, -1, -1),
         )
 
         for _ in range(self.config["repeat_last_step"]):
-            input_tuple, () = fn(input_tuple, 0)
+            input_tuple, last_output = fn(input_tuple, 0)
+            if return_attention_weights:
+                scan_output = last_output
 
         action_0, rng = input_tuple
 
         if batch_size == 1:
             # this is an evaluation call so unbatch
-            return action_0[0]
+            if return_attention_weights:
+                return action_0[0], scan_output
+            else:
+                return action_0[0]
         else:
-            return action_0
+            if return_attention_weights:
+                return action_0, scan_output
+            else:
+                return action_0
 
     @jax.jit
     def get_debug_metrics(self, batch, seed, gripper_close_val=None):
@@ -252,7 +272,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                 use_proprio=use_proprio,
                 stop_gradient=False,
             )
-        ## TODO: define Imagination_ScoreActor for imagination-augmented LCEncodingWrapper
+        ## ScoreActor also now takes train in __call__ and uses dropout accordingly
         # lang embedding = 512
         networks = {
             "actor": ScoreActor(
