@@ -156,7 +156,7 @@ def main(_):
         else:
             if not FLAGS.config.dataset_kwargs.get("load_img_similar_instruct", False):
                 batch["goals"]["language"] = text_processor.encode(batch["goals"]["language"]) ## Even here len(get_shape(batch["goals"]["language"])) is 2; (B,1)
-                print("Shape of language:", get_shape(batch["goals"]["language"]))
+                # print("Shape of language:", get_shape(batch["goals"]["language"]))
             else:
                 batch["goals"]["language"] = text_processor.encode(batch["goals"]["language"]) ## Even here len(get_shape(batch["goals"]["language"])) is 2; (B,1)
                 lang = batch["goals"]["language_with_similar"]

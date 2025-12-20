@@ -172,12 +172,12 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         if batch_size == 1:
             # this is an evaluation call so unbatch
             if return_attention_weights:
-                return action_0[0], scan_output
+                return action_0[0], scan_output[-1, 0]
             else:
                 return action_0[0]
         else:
             if return_attention_weights:
-                return action_0, scan_output
+                return action_0, scan_output[-1]
             else:
                 return action_0
 

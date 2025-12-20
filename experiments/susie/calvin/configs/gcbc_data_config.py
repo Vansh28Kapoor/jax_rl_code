@@ -80,12 +80,12 @@ def get_config(config_string):
             {
                 "include": [
                     [
-                        "training/A/?*/?*",
-                        "training/B/?*/?*",
-                        "training/C/?*/?*"
+                        "training/A/?*",
+                        "training/B/?*",
+                        "training/C/?*"
                     ],
                     [
-                        "validation/D/?*/?*",
+                        "validation/D/?*",
                     ]
                 ],
                 "exclude": [],
