@@ -70,6 +70,8 @@ def get_config(config_string):
                     #goal_relabeling_kwargs=dict(reached_proportion=0.0),
                     #load_language=True,
                     #skip_unlabeled=True,
+                    use_goal_relabeling=True,
+                    load_susie_goal_images=False,
                     relabel_actions=False,
                     act_pred_horizon=4,
                     obs_horizon=1,

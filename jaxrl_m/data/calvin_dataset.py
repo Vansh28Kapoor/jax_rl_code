@@ -85,6 +85,7 @@ class CalvinDataset:
         action_proprio_metadata: Optional[dict] = None,
         normalization_type: Optional[str] = "normal",
         relabel_actions: bool = True,
+        use_goal_relabeling: bool = True,
         goal_relabeling_strategy: str = "uniform",
         goal_relabeling_kwargs: dict = {},
         sample_weights: Optional[List[float]] = None,
@@ -115,6 +116,7 @@ class CalvinDataset:
         self.relabel_actions = relabel_actions
         self.action_proprio_metadata = action_proprio_metadata
         self.normalization_type = normalization_type
+        self.use_goal_relabeling = use_goal_relabeling
         self.goal_relabeling_strategy = goal_relabeling_strategy
         self.goal_relabeling_kwargs = goal_relabeling_kwargs
         self.cache = cache
@@ -387,10 +389,20 @@ class CalvinDataset:
             )
             
             
-
-        traj = GOAL_RELABELING_FUNCTIONS[self.goal_relabeling_strategy](
-            traj, **self.goal_relabeling_kwargs
-        )
+        if self.use_goal_relabeling:
+            traj = GOAL_RELABELING_FUNCTIONS[self.goal_relabeling_strategy](
+                traj, **self.goal_relabeling_kwargs
+            )
+        else:
+            assert "susie_goal_images" in traj and self.load_susie_goal_images, "susie_goal_images must be in traj if not using goal relabeling"
+            traj["goals"] = {}
+            if self.obs_horizon is not None:
+                traj["goals"]["image"] = traj["susie_goal_images"][:, -1]
+            else:
+                traj["goals"]["image"] = traj["susie_goal_images"]
+            traj_len = tf.shape(traj["goals"]["image"])[0]
+                
+            traj["goal_dists"] = traj_len - tf.range(traj_len)
 
         if self.load_language:
             # lang = traj["language"]
@@ -529,7 +541,7 @@ class CalvinDataset:
             
             # Remove the separate susie_goal_images tensor
             image.pop("susie_goal_images")
-        elif self.load_susie_goal_images:
+        elif self.load_susie_goal_images and self.use_goal_relabeling:
             # Original single goal image case
             # Apply same augmentation to susie goal images
             image["susie_goal_images"] = augment(
@@ -561,7 +573,7 @@ class CalvinDataset:
             ], axis=1)
             
             image.pop("susie_goal_images")
-        elif self.load_susie_goal_images and "susie_goal_images" in image:
+        elif self.load_susie_goal_images and self.use_goal_relabeling and "susie_goal_images" in image:
             # Original single goal image case
             image["observations"]["image"] = tf.concat([
                 image["observations"]["image"], 
