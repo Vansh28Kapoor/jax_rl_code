@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mmdit-jax"
+version = "0.0.1"
+description = "Multi-modal DiT (Diffusion Transformer) implementation in JAX/Equinox"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"},
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.8"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "jax>=0.4.13",
+    "equinox>=0.10.4",
+    "einops>=0.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipdb",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/mmdit-jax"
+Repository = "https://github.com/yourusername/mmdit-jax"
+Documentation = "https://mmdit-jax.readthedocs.io"
+Issues = "https://github.com/yourusername/mmdit-jax/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mmdit_jax"] 

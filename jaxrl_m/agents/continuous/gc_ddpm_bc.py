@@ -8,20 +8,24 @@ import numpy as np
 import flax
 import flax.linen as nn
 import optax
+import equinox as eqx
 
 from flax.core import FrozenDict
 from jaxrl_m.common.typing import Batch
 from jaxrl_m.common.typing import PRNGKey
 from jaxrl_m.common.common import JaxRLTrainState, ModuleDict, nonpytree_field
-from jaxrl_m.common.encoding import GCEncodingWrapper, LCEncodingWrapper, Imaginations_LCEncodingWrapper, Imaginations_LCEncodingWrapper_Attention
+from jaxrl_m.common.encoding import GCEncodingWrapper, LCEncodingWrapper, Imaginations_LCEncodingWrapper, Imaginations_LCEncodingWrapper_Attention, Imaginations_LCEncodingWrapper_MultiLayerMultiHeadAttention, DiTEncoder
 
 from jaxrl_m.networks.diffusion_nets import (
     FourierFeatures,
     cosine_beta_schedule,
     vp_beta_schedule,
     ScoreActor,
+    MMDiTScoreActor,
+    InContextMMDiTScoreActor
 )
 from jaxrl_m.networks.mlp import MLP, MLPResNet
+from mmdit_jax import MMDiT, InContextMMDiT
 
 
 def ddpm_bc_loss(noise_prediction, noise):
@@ -76,10 +80,80 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
 
         loss_fns = {"actor": actor_loss_fn}
 
+        # Store old params for change tracking
+        old_params = self.state.params
+        
         # compute gradients and update params
         new_state, info = self.state.apply_loss_fns(
             loss_fns, pmap_axis=pmap_axis, has_aux=True
         )
+
+        # Log parameter changes and gradient norms
+        new_params = new_state.params
+        
+        # Track encoder parameters (handle both 'actor' and 'modules_actor' keys)
+        actor_key = 'modules_actor' if 'modules_actor' in old_params else 'actor'
+        if actor_key in old_params and 'encoder' in old_params[actor_key]:
+            encoder_old = jax.tree_util.tree_leaves(old_params[actor_key]['encoder'])
+            encoder_new = jax.tree_util.tree_leaves(new_params[actor_key]['encoder'])
+            encoder_old_arrays = [x for x in encoder_old if isinstance(x, jnp.ndarray)]
+            encoder_new_arrays = [x for x in encoder_new if isinstance(x, jnp.ndarray)]
+            
+            if len(encoder_old_arrays) > 0 and len(encoder_old_arrays) == len(encoder_new_arrays):
+                encoder_changes = [jnp.sqrt(jnp.mean((new - old)**2)) 
+                                 for old, new in zip(encoder_old_arrays, encoder_new_arrays)]
+                encoder_mean_change = jnp.mean(jnp.array(encoder_changes))
+                encoder_max_change = jnp.max(jnp.array(encoder_changes))
+                encoder_params_changed = jnp.sum(jnp.array(encoder_changes) > 1e-10)
+                encoder_total = len(encoder_changes)
+                
+                # Absolute metrics
+                info["encoder_param_change_mean"] = encoder_mean_change
+                info["encoder_param_change_max"] = encoder_max_change
+                info["encoder_params_arrays_changed"] = encoder_params_changed
+                info["encoder_total_param_arrays"] = encoder_total
+                
+                # Percentage metrics (for easy plotting)
+                info["encoder_percent_arrays_updated"] = 100.0 * encoder_params_changed / encoder_total
+        
+        # Track MMDiT parameters (if using MMDiT)
+        if actor_key in old_params and 'mmdit' in old_params[actor_key]:
+            mmdit_old = jax.tree_util.tree_leaves(old_params[actor_key]['mmdit'])
+            mmdit_new = jax.tree_util.tree_leaves(new_params[actor_key]['mmdit'])
+            mmdit_old_arrays = [x for x in mmdit_old if isinstance(x, jnp.ndarray)]
+            mmdit_new_arrays = [x for x in mmdit_new if isinstance(x, jnp.ndarray)]
+            
+            if len(mmdit_old_arrays) > 0 and len(mmdit_old_arrays) == len(mmdit_new_arrays):
+                mmdit_changes = [jnp.sqrt(jnp.mean((new - old)**2)) 
+                               for old, new in zip(mmdit_old_arrays, mmdit_new_arrays)]
+                mmdit_mean_change = jnp.mean(jnp.array(mmdit_changes))
+                mmdit_max_change = jnp.max(jnp.array(mmdit_changes))
+                mmdit_params_changed = jnp.sum(jnp.array(mmdit_changes) > 1e-10)
+                mmdit_total = len(mmdit_changes)
+                
+                # Absolute metrics
+                info["mmdit_param_change_mean"] = mmdit_mean_change
+                info["mmdit_param_change_max"] = mmdit_max_change
+                info["mmdit_params_arrays_changed"] = mmdit_params_changed
+                info["mmdit_total_param_arrays"] = mmdit_total
+                
+                # Percentage metrics (for easy plotting)
+                info["mmdit_percent_arrays_updated"] = 100.0 * mmdit_params_changed / mmdit_total
+                
+                # Flag if MMDiT params are NOT changing (use jnp.where for JIT compatibility)
+                info["WARNING_mmdit_frozen"] = jnp.where(mmdit_mean_change < 1e-10, 1.0, 0.0)
+        else:
+            # Log that MMDiT params are not found (if use_mmdit=True, this is a problem!)
+            info["mmdit_in_params"] = 0.0
+            info["mmdit_percent_arrays_updated"] = 0.0
+        
+        # Comparison metrics (if both encoder and MMDiT present)
+        if 'encoder_percent_arrays_updated' in info and 'mmdit_percent_arrays_updated' in info:
+            # Overall update percentage across all actor parameters
+            if 'encoder_total_param_arrays' in info and 'mmdit_total_param_arrays' in info:
+                total_arrays = info["encoder_total_param_arrays"] + info["mmdit_total_param_arrays"]
+                total_changed = info["encoder_params_arrays_changed"] + info["mmdit_params_arrays_changed"]
+                info["actor_total_percent_arrays_updated"] = 100.0 * total_changed / total_arrays
 
         # update the target params
         new_state = new_state.target_update(self.config["target_update_rate"])
@@ -112,6 +186,7 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                 (observations, goals),
                 current_x,
                 input_time,
+                train=False,  # CRITICAL: Use eval mode during sampling
                 return_attention_weights=return_attention_weights,
                 name="actor",
             )
@@ -203,7 +278,30 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
         language_conditioned: bool = False,
         imagination_augmented: bool = False,
         use_attention_in_imagination: bool = False,
+        attention_type_in_imagination: str = "single_head",  # "single_head" or "multi_head"
+        mmdit_type: str = None, # "mmdit"/ "incontext"
+        mmdit_network_kwargs: dict = {
+                "depth": 2,
+                "dim_cond": 256,
+                "dim_head": 64,
+                "timestep_embed_dim":64,
+                "heads": 4,
+                "ff_mult": 4
+        },
+        incontext_mmdit_network_kwargs: dict = {
+                "depth": 12,
+                "dim_head": 128,
+                "heads": 4,
+                "ff_mult": 4,
+                "timestep_embed_dim":256,
+                "num_blocks": 3,
+                "dropout_rate": 0.1,
+                "hidden_dim": 256,
+                "use_layer_norm": True,
+        },
+        embed_lang_in_observation: bool = True,
         num_similar_instructions_used: int = 2,
+        use_null_similar_images: bool = False,
         shared_goal_encoder: bool = True,
         early_goal_concat: bool = False,
         use_proprio: bool = False,
@@ -238,15 +336,27 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                     stop_gradient=False,
                 )
             else:
-                if use_attention_in_imagination:
-                    # Use imagination-augmented LCEncodingWrapper with attention
-                    print(f">>> Using Imaginations_LCEncodingWrapper_Attention (use_attention_in_imagination={use_attention_in_imagination}, num_similar={num_similar_instructions_used})")
-                    encoder_def = Imaginations_LCEncodingWrapper_Attention(
-                        encoder=encoder_def,
-                        use_proprio=use_proprio,
-                        stop_gradient=False,
-                        num_similar_instructions_used=num_similar_instructions_used
-                    )
+                if mmdit_type is not None:
+                    print(f">>> Using MMDiTScoreActor {mmdit_type}")
+                    encoder_def = DiTEncoder(encoder=encoder_def, num_similar_instructions_used=num_similar_instructions_used, embed_lang_in_observation=embed_lang_in_observation)
+                elif use_attention_in_imagination:
+                    if attention_type_in_imagination == "single_head":
+                        print(f">>> Using Imaginations_LCEncodingWrapper_Attention (use_attention_in_imagination={use_attention_in_imagination}, num_similar={num_similar_instructions_used})")
+                        encoder_def = Imaginations_LCEncodingWrapper_Attention(
+                            encoder=encoder_def,
+                            use_proprio=use_proprio,
+                            stop_gradient=False,
+                            num_similar_instructions_used=num_similar_instructions_used,
+                            use_null_similar_images=use_null_similar_images,
+                        )
+                    elif attention_type_in_imagination == "multi_head":
+                        print(f">>> Using Imaginations_LCEncodingWrapper_MultiLayerMultiHeadAttention (use_attention_in_imagination={use_attention_in_imagination}, num_similar={num_similar_instructions_used})")
+                        encoder_def = Imaginations_LCEncodingWrapper_MultiLayerMultiHeadAttention(
+                            encoder=encoder_def,
+                            use_proprio=use_proprio,
+                            stop_gradient=False,
+                            num_similar_instructions_used=num_similar_instructions_used
+                        )
                 else:
                     print(f">>> Using Imaginations_LCEncodingWrapper (no attention, num_similar={num_similar_instructions_used})")
                     encoder_def = Imaginations_LCEncodingWrapper(
@@ -272,26 +382,82 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
                 use_proprio=use_proprio,
                 stop_gradient=False,
             )
-        ## ScoreActor also now takes train in __call__ and uses dropout accordingly
-        # lang embedding = 512
-        networks = {
-            "actor": ScoreActor(
-                encoder_def,
-                FourierFeatures(score_network_kwargs["time_dim"], learnable=True),
-                MLP(
-                    (
-                        2 * score_network_kwargs["time_dim"],
-                        score_network_kwargs["time_dim"],
+        
+        if mmdit_type is None:
+            ## ScoreActor also now takes train in __call__ and uses dropout accordingly
+            # lang embedding = 512
+            networks = {
+                "actor": ScoreActor(
+                    encoder_def,
+                    FourierFeatures(score_network_kwargs["time_dim"], learnable=True),
+                    MLP(
+                        (
+                            2 * score_network_kwargs["time_dim"],
+                            score_network_kwargs["time_dim"],
+                        )
+                    ),
+                    MLPResNet(
+                        score_network_kwargs["num_blocks"],
+                        actions.shape[-2] * actions.shape[-1],
+                        dropout_rate=score_network_kwargs["dropout_rate"],
+                        use_layer_norm=score_network_kwargs["use_layer_norm"],
+                    ),
+                )
+            }
+        else:
+            rng, mmdit_rng = jax.random.split(rng)
+            if mmdit_type == "mmdit":
+                mmdit = MMDiT(
+                    **mmdit_network_kwargs,
+                    dim_modalities=(1024, actions.shape[-2] * actions.shape[-1]),  # (obs_dim, action_dim)
+                    dim_outs=(1024, actions.shape[-2] * actions.shape[-1]),  # Output dimensions
+                    key=mmdit_rng,
+                )
+                
+                # Separate MMDiT into trainable parameters (arrays) and static structure
+                # This allows Flax to manage the parameters while keeping the structure intact
+                mmdit_params, mmdit_static = eqx.partition(mmdit, eqx.is_array)
+                
+                networks = {
+                    "actor": MMDiTScoreActor(
+                        encoder=encoder_def,
+                        mmdit_params_template=mmdit_params,
+                        mmdit_static=mmdit_static
                     )
-                ),
-                MLPResNet(
-                    score_network_kwargs["num_blocks"],
-                    actions.shape[-2] * actions.shape[-1],
-                    dropout_rate=score_network_kwargs["dropout_rate"],
-                    use_layer_norm=score_network_kwargs["use_layer_norm"],
-                ),
-            )
-        }
+                }
+            elif mmdit_type == "incontext":
+                mmdit = InContextMMDiT(
+                    depth=incontext_mmdit_network_kwargs['depth'],
+                    dim_modalities=(1024,),  # Single modality tuple (image_dim, language_dim)
+                    dim_outs=(512,),  # Output dimensions 
+                    dim_head=incontext_mmdit_network_kwargs["dim_head"],
+                    heads=incontext_mmdit_network_kwargs["heads"],
+                    ff_mult=incontext_mmdit_network_kwargs["ff_mult"],
+                    key=mmdit_rng,
+                )
+                mmdit_params, mmdit_static = eqx.partition(mmdit, eqx.is_array)
+                
+                networks = {
+                    "actor": InContextMMDiTScoreActor(
+                            encoder_def,
+                            FourierFeatures(incontext_mmdit_network_kwargs["timestep_embed_dim"], learnable=False),
+                            MLP(
+                                (
+                                    incontext_mmdit_network_kwargs["timestep_embed_dim"],
+                                    incontext_mmdit_network_kwargs["timestep_embed_dim"],
+                                )
+                            ),
+                            MLPResNet(
+                                incontext_mmdit_network_kwargs["num_blocks"],
+                                actions.shape[-2] * actions.shape[-1],
+                                dropout_rate=incontext_mmdit_network_kwargs["dropout_rate"],
+                                use_layer_norm=incontext_mmdit_network_kwargs["use_layer_norm"],
+                                hidden_dim=incontext_mmdit_network_kwargs["hidden_dim"],
+                            ),
+                            mmdit_params_template=mmdit_params,
+                            mmdit_static=mmdit_static
+                    )
+                }
 
         model_def = ModuleDict(networks)
 
@@ -332,6 +498,66 @@ class GCDDPMBCAgent(flax.struct.PyTreeNode):
             target_params=params,
             rng=create_rng,
         )
+
+        # Log parameter structure at initialization (check state.params, not params)
+        print("\n" + "="*80)
+        print("AGENT INITIALIZATION - PARAMETER STRUCTURE")
+        print("="*80)
+        
+        # Check state.params (this is what's actually used during training)
+        check_params = state.params
+        print(f"DEBUG: state.params type = {type(check_params)}")
+        print(f"DEBUG: state.params keys = {list(check_params.keys()) if hasattr(check_params, 'keys') else 'no keys method'}")
+        
+        # Try to find actor params - might be at different nesting levels
+        actor_params = None
+        if hasattr(check_params, 'keys'):
+            if 'actor' in check_params:
+                actor_params = check_params['actor']
+                print(f"✅ Found 'actor' at state.params['actor']")
+            elif 'modules_actor' in check_params:
+                # ModuleDict wraps with 'modules_' prefix
+                actor_params = check_params['modules_actor']
+                print(f"✅ Found 'actor' at state.params['modules_actor']")
+            elif 'params' in check_params and 'actor' in check_params['params']:
+                actor_params = check_params['params']['actor']
+                print(f"✅ Found 'actor' at state.params['params']['actor']")
+            else:
+                print(f"⚠️  'actor' not found in expected locations")
+        
+        if actor_params is not None:
+            actor_keys = list(actor_params.keys()) if hasattr(actor_params, 'keys') else []
+            print(f"   Actor keys: {actor_keys}")
+            
+            # Check encoder
+            if 'encoder' in actor_params:
+                encoder_leaves = jax.tree_util.tree_leaves(actor_params['encoder'])
+                encoder_arrays = [x for x in encoder_leaves if isinstance(x, jnp.ndarray)]
+                encoder_count = sum(x.size for x in encoder_arrays)
+                print(f"   ✅ Encoder: {len(encoder_arrays)} arrays, {encoder_count:,} total params")
+            
+            # Check MMDiT
+            if mmdit_type is not None:
+                if 'mmdit' in actor_params:
+                    mmdit_leaves = jax.tree_util.tree_leaves(actor_params['mmdit'])
+                    mmdit_arrays = [x for x in mmdit_leaves if isinstance(x, jnp.ndarray)]
+                    mmdit_count = sum(x.size for x in mmdit_arrays)
+                    print(f"   ✅ MMDiT: {len(mmdit_arrays)} arrays, {mmdit_count:,} total params")
+                    
+                    if mmdit_count > 1_000_000:
+                        print(f"   ✅ MMDiT size looks correct ({mmdit_count/1e6:.1f}M params)")
+                    else:
+                        print(f"   ⚠️  MMDiT seems small ({mmdit_count:,} params)")
+                else:
+                    print(f"   ❌ ERROR: use_mmdit=True but 'mmdit' NOT in actor params!")
+                    print(f"   This means MMDiT parameters are NOT being trained!")
+                    print(f"   Available keys: {actor_keys}")
+            else:
+                print(f"   use_mmdit=False, not using MMDiT")
+        else:
+            print(f"❌ Could not find 'actor' in state.params structure!")
+            print(f"   Top-level keys: {list(check_params.keys()) if hasattr(check_params, 'keys') else 'N/A'}")
+        print("="*80 + "\n")
 
         if beta_schedule == "cosine":
             betas = jnp.array(cosine_beta_schedule(diffusion_steps))
